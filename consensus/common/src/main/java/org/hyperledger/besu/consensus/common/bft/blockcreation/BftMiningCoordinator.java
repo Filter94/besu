@@ -136,11 +136,10 @@ public class BftMiningCoordinator implements MiningCoordinator, BlockAddedObserv
 
   @Override
   public synchronized void start() {
-    // Wait for any teardown left in flight by a prior stop() before re-initializing: stop()
-    // returns as soon as it has dispatched that teardown, without waiting for it to finish
-    // (see stop()), so without this a restart could race a still-running teardown of the
-    // previous bftProcessor/bftExecutors instance. synchronized alone would not prevent this:
-    // stop() releases the monitor well before the dispatched teardown completes.
+    // Wait for any teardown left in flight by a prior stop() before re-initializing. This is a
+    // no-op in the common case: stop() only leaves teardown in flight when it was unable to
+    // block for it itself (see stop()); otherwise teardown is already complete by the time
+    // stop() returns, and pendingTeardown is left at its already-completed default.
     //
     // NOTE: start() must never be called from the BFT event thread itself, or this would
     // deadlock waiting for a teardown that is, in turn, waiting for that same thread's event
@@ -179,12 +178,16 @@ public class BftMiningCoordinator implements MiningCoordinator, BlockAddedObserv
       // is essential when the merge transition watcher calls stop() from the BFT event thread
       // itself (via block-added observers fired while QBFT imports the terminal block).
       bftProcessor.stop();
-      // The remaining teardown blocks until the processor's event loop has actually exited,
-      // which this call cannot safely do inline: it may be running ON that very event thread,
-      // in which case waiting for its own exit would deadlock. So this part always completes
-      // asynchronously, regardless of which thread called stop() - start() waits for it (via
+      // stop() blocks the calling thread until the coordinator has genuinely stopped, unless
+      // doing so is logically impossible: the merge transition watcher can invoke stop() from
+      // the BFT event thread itself, and that thread can never wait for its own exit. That one
+      // case, and only that case, defers the remaining teardown; start() waits for it (via
       // pendingTeardown.join()) before allowing a subsequent restart to proceed.
-      pendingTeardown = CompletableFuture.runAsync(this::completeStop);
+      if (bftProcessor.isEventThread()) {
+        pendingTeardown = CompletableFuture.runAsync(this::completeStop);
+      } else {
+        completeStop();
+      }
     }
   }
 
