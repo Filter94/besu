@@ -74,17 +74,6 @@ public class BftProcessor implements Runnable {
     shutdownLatch.await();
   }
 
-  /**
-   * Returns whether the calling thread is the thread currently executing this processor's event
-   * loop. Callers performing a blocking shutdown (e.g. waiting on {@link #awaitStop()}) must not do
-   * so from the event thread itself.
-   *
-   * @return true if the calling thread is the BFT event processing thread
-   */
-  public boolean isEventThread() {
-    return Thread.currentThread() == processorThread;
-  }
-
   @Override
   public void run() {
     processorThread = Thread.currentThread();

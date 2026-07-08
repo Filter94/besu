@@ -266,7 +266,9 @@ public class TransitionBesuControllerBuilder extends BesuControllerBuilder {
           if (isPoS) {
             // if we transitioned to post-merge, stop and disable any mining
             // Note: this callback can run on the BFT event thread itself (during import of the
-            // terminal block), so stop() must remain safe to call from that thread.
+            // terminal block), so stop() must remain safe to call from that thread: it signals
+            // shutdown synchronously (so no further events are dispatched) but never blocks
+            // waiting for that thread's own exit - see BftMiningCoordinator.stop().
             composedCoordinator.getPreMergeObject().disable();
             composedCoordinator.getPreMergeObject().stop();
             // set the blockchoiceRule to never reorg, rely on forkchoiceUpdated instead

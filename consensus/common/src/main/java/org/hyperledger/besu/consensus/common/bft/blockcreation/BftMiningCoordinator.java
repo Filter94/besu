@@ -71,9 +71,8 @@ public class BftMiningCoordinator implements MiningCoordinator, BlockAddedObserv
 
   private volatile long blockAddedObserverId = NOT_REGISTERED;
   private final AtomicReference<State> state = new AtomicReference<>(State.UNINITIALIZED);
-  // The teardown thread spawned by a stop() invoked from the BFT event thread, if any is
-  // currently in flight; null once start()/stop() have observed it finish. Guarded by this
-  // object's monitor together with start()/stop() themselves, see the note on start().
+  // The teardown thread spawned by the most recent stop() call, if it has not yet been observed
+  // to finish. Guarded by this object's monitor together with start()/stop(), see start().
   private Thread pendingTeardown;
 
   private SyncState syncState;
@@ -135,13 +134,11 @@ public class BftMiningCoordinator implements MiningCoordinator, BlockAddedObserv
 
   @Override
   public synchronized void start() {
-    // A stop() invoked from the BFT event thread tears down asynchronously on a separate
-    // thread (see stop()) and returns before that teardown finishes. Without waiting for it
-    // here, a start() racing that teardown could re-create bftProcessor/bftExecutors state
-    // while the old one is still mid-teardown, or a later stop() could tear down the newly
-    // started instance concurrently with the still-running old teardown. synchronized alone
-    // does not prevent this: stop() releases the monitor as soon as it has spawned the
-    // teardown thread, well before that thread finishes.
+    // Wait for any teardown left in flight by a prior stop() before re-initializing: stop()
+    // returns as soon as it has signalled shutdown, without waiting for that teardown to
+    // finish (see stop()), so without this a restart could race a still-running teardown of
+    // the previous bftProcessor/bftExecutors instance. synchronized alone would not prevent
+    // this: stop() releases the monitor well before its spawned teardown thread completes.
     //
     // NOTE: start() must never be called from the BFT event thread itself, or this would
     // deadlock waiting for a teardown that is, in turn, waiting for that same thread's event
@@ -175,21 +172,20 @@ public class BftMiningCoordinator implements MiningCoordinator, BlockAddedObserv
       if (blockAddedObserverId != NOT_REGISTERED) {
         blockchain.removeObserver(blockAddedObserverId);
       }
+      // Signals shutdown synchronously: sets the processor's shutdown flag immediately, on
+      // this thread, guaranteeing no further event is dispatched once this call returns - this
+      // is essential when the merge transition watcher calls stop() from the BFT event thread
+      // itself (via block-added observers fired while QBFT imports the terminal block).
       bftProcessor.stop();
-      // The merge transition watcher invokes stop() from the BFT event thread itself
-      // (via the block-added observers fired while QBFT imports the terminal block).
-      // The shutdown flag is already set, so no further events will be dispatched;
-      // the blocking teardown must not run on the event thread or awaitStop() would
-      // wait on the thread's own exit. start() waits for this thread (see awaitPendingTeardown())
-      // before allowing a subsequent restart to proceed.
-      if (bftProcessor.isEventThread()) {
-        final Thread teardown = new Thread(this::completeStop, "BftMiningCoordinator-stop");
-        teardown.setDaemon(true);
-        pendingTeardown = teardown;
-        teardown.start();
-      } else {
-        completeStop();
-      }
+      // The remaining teardown blocks until the processor's event loop has actually exited,
+      // which this call cannot safely do inline: it may be running ON that very event thread,
+      // in which case waiting for its own exit would deadlock. So this part always completes
+      // asynchronously, regardless of which thread called stop() - start() waits for it (see
+      // awaitPendingTeardown()) before allowing a subsequent restart to proceed.
+      final Thread teardown = new Thread(this::completeStop, "BftMiningCoordinator-stop");
+      teardown.setDaemon(true);
+      pendingTeardown = teardown;
+      teardown.start();
     }
   }
 
