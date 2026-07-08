@@ -201,6 +201,74 @@ public class BftMiningCoordinatorTransitionTest {
     bftExecutors.awaitStop();
   }
 
+  @Test
+  @Timeout(value = 15, unit = TimeUnit.SECONDS)
+  public void redundantStopWaitsForInFlightTeardownFromPriorEventThreadStop()
+      throws InterruptedException {
+    final BftEventQueue eventQueue = new BftEventQueue(1000);
+    eventQueue.start();
+    final BftExecutors bftExecutors =
+        BftExecutors.create(new NoOpMetricsSystem(), BftExecutors.ConsensusType.QBFT);
+
+    // Block completeStop() part-way through, inside eventHandler.stop(), so the test can
+    // deterministically observe "teardown is in flight" before letting it finish.
+    final CountDownLatch teardownStarted = new CountDownLatch(1);
+    final CountDownLatch releaseTeardown = new CountDownLatch(1);
+    doAnswer(
+            invocation -> {
+              teardownStarted.countDown();
+              releaseTeardown.await();
+              return null;
+            })
+        .when(eventHandler)
+        .stop();
+
+    final AtomicReference<BftMiningCoordinator> coordinatorRef = new AtomicReference<>();
+    // Simulates the TTD watcher: disable() then stop(), invoked on the BFT event thread.
+    final EventMultiplexer eventMultiplexer =
+        new EventMultiplexer(eventHandler) {
+          @Override
+          public void handleBftEvent(final BftEvent bftEvent) {
+            coordinatorRef.get().disable();
+            coordinatorRef.get().stop();
+          }
+        };
+
+    final BftProcessor bftProcessor = new BftProcessor(eventQueue, eventMultiplexer);
+    final BftMiningCoordinator coordinator =
+        new BftMiningCoordinator(
+            bftExecutors, eventHandler, bftProcessor, blockCreatorFactory, blockchain, eventQueue);
+    coordinatorRef.set(coordinator);
+
+    coordinator.enable();
+    coordinator.start();
+    eventQueue.add(new BlockTimerExpiry(new ConsensusRoundIdentifier(1, 0)));
+
+    // Wait until stop()'s async teardown thread is blocked inside eventHandler.stop().
+    assertThat(teardownStarted.await(10, TimeUnit.SECONDS)).isTrue();
+
+    // By now, state is already STOPPED (set synchronously). A redundant stop() call from an
+    // ordinary thread must still block until the in-flight teardown finishes - it must not
+    // return early just because its own CAS attempts find nothing left to transition.
+    final AtomicBoolean redundantStopReturned = new AtomicBoolean(false);
+    final Thread redundantStopper =
+        new Thread(
+            () -> {
+              coordinator.stop();
+              redundantStopReturned.set(true);
+            });
+    redundantStopper.start();
+
+    Thread.sleep(500);
+    assertThat(redundantStopReturned.get()).isFalse();
+
+    releaseTeardown.countDown();
+    redundantStopper.join(TimeUnit.SECONDS.toMillis(10));
+    assertThat(redundantStopReturned.get()).isTrue();
+
+    bftExecutors.awaitStop();
+  }
+
   /**
    * Reproduces the exact scenario raised in PR review (besu-eth/besu#10733, discussion
    * r3543146286):

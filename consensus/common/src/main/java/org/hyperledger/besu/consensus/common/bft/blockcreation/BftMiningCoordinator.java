@@ -181,14 +181,50 @@ public class BftMiningCoordinator implements MiningCoordinator, BlockAddedObserv
       // stop() blocks the calling thread until the coordinator has genuinely stopped, unless
       // doing so is logically impossible: the merge transition watcher can invoke stop() from
       // the BFT event thread itself, and that thread can never wait for its own exit. That one
-      // case, and only that case, defers the remaining teardown; start() waits for it (via
-      // pendingTeardown.join()) before allowing a subsequent restart to proceed.
+      // case, and only that case, defers the remaining teardown to a dedicated thread; start()
+      // (and a redundant stop(), see below) wait for it via pendingTeardown.join().
       if (bftProcessor.isEventThread()) {
-        pendingTeardown = CompletableFuture.runAsync(this::completeStop);
+        pendingTeardown = dispatchTeardown();
       } else {
         completeStop();
       }
+    } else if (!bftProcessor.isEventThread()) {
+      // Already stopped (or never started) - but that may be the result of a still in-flight
+      // deferred teardown from an earlier event-thread stop() (the CAS above only fails once
+      // that teardown has already flipped state to STOPPED; it says nothing about whether the
+      // teardown itself has finished). Block for it here too, so a redundant stop() keeps the
+      // same blocking contract as a real one, for every caller except the event thread. This is
+      // a no-op when nothing is in flight: pendingTeardown is already complete by default.
+      pendingTeardown.join();
     }
+  }
+
+  /**
+   * Runs {@link #completeStop()} on a dedicated daemon thread, since it may block for real time
+   * (awaiting the processor's event loop exit) and must not run on the BFT event thread itself.
+   * Uses an explicit thread rather than {@link CompletableFuture#runAsync(Runnable)}'s default (the
+   * shared, JVM-wide {@link java.util.concurrent.ForkJoinPool#commonPool()}) so this
+   * potentially-blocking teardown cannot starve unrelated common-pool work elsewhere in the
+   * process, and so it shows up under a descriptive name in thread dumps.
+   *
+   * @return a future that completes once completeStop() returns
+   */
+  private CompletableFuture<Void> dispatchTeardown() {
+    final CompletableFuture<Void> future = new CompletableFuture<>();
+    final Thread teardown =
+        new Thread(
+            () -> {
+              try {
+                completeStop();
+                future.complete(null);
+              } catch (final Throwable t) {
+                future.completeExceptionally(t);
+              }
+            },
+            "BftMiningCoordinator-stop");
+    teardown.setDaemon(true);
+    teardown.start();
+    return future;
   }
 
   private void completeStop() {
