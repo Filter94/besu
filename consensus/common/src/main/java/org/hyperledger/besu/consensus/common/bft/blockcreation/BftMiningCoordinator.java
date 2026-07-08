@@ -32,6 +32,7 @@ import org.hyperledger.besu.plugin.services.BesuEvents;
 
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.slf4j.Logger;
@@ -71,9 +72,10 @@ public class BftMiningCoordinator implements MiningCoordinator, BlockAddedObserv
 
   private volatile long blockAddedObserverId = NOT_REGISTERED;
   private final AtomicReference<State> state = new AtomicReference<>(State.UNINITIALIZED);
-  // The teardown thread spawned by the most recent stop() call, if it has not yet been observed
-  // to finish. Guarded by this object's monitor together with start()/stop(), see start().
-  private Thread pendingTeardown;
+  // The teardown dispatched by the most recent stop() call. Guarded by this object's monitor
+  // together with start()/stop(), see start(). Starts pre-completed so start() never needs a
+  // null check before the first stop().
+  private CompletableFuture<Void> pendingTeardown = CompletableFuture.completedFuture(null);
 
   private SyncState syncState;
 
@@ -135,16 +137,16 @@ public class BftMiningCoordinator implements MiningCoordinator, BlockAddedObserv
   @Override
   public synchronized void start() {
     // Wait for any teardown left in flight by a prior stop() before re-initializing: stop()
-    // returns as soon as it has signalled shutdown, without waiting for that teardown to
-    // finish (see stop()), so without this a restart could race a still-running teardown of
-    // the previous bftProcessor/bftExecutors instance. synchronized alone would not prevent
-    // this: stop() releases the monitor well before its spawned teardown thread completes.
+    // returns as soon as it has dispatched that teardown, without waiting for it to finish
+    // (see stop()), so without this a restart could race a still-running teardown of the
+    // previous bftProcessor/bftExecutors instance. synchronized alone would not prevent this:
+    // stop() releases the monitor well before the dispatched teardown completes.
     //
     // NOTE: start() must never be called from the BFT event thread itself, or this would
     // deadlock waiting for a teardown that is, in turn, waiting for that same thread's event
     // loop to exit. No current caller does this (start() is only invoked from node-startup or
     // sync-status callback threads).
-    awaitPendingTeardown();
+    pendingTeardown.join();
     if (state.compareAndSet(State.IDLE, State.RUNNING)
         || state.compareAndSet(State.STOPPED, State.RUNNING)) {
       bftProcessor.start();
@@ -180,26 +182,10 @@ public class BftMiningCoordinator implements MiningCoordinator, BlockAddedObserv
       // The remaining teardown blocks until the processor's event loop has actually exited,
       // which this call cannot safely do inline: it may be running ON that very event thread,
       // in which case waiting for its own exit would deadlock. So this part always completes
-      // asynchronously, regardless of which thread called stop() - start() waits for it (see
-      // awaitPendingTeardown()) before allowing a subsequent restart to proceed.
-      final Thread teardown = new Thread(this::completeStop, "BftMiningCoordinator-stop");
-      teardown.setDaemon(true);
-      pendingTeardown = teardown;
-      teardown.start();
+      // asynchronously, regardless of which thread called stop() - start() waits for it (via
+      // pendingTeardown.join()) before allowing a subsequent restart to proceed.
+      pendingTeardown = CompletableFuture.runAsync(this::completeStop);
     }
-  }
-
-  private void awaitPendingTeardown() {
-    if (pendingTeardown == null) {
-      return;
-    }
-    try {
-      pendingTeardown.join();
-    } catch (final InterruptedException e) {
-      LOG.debug("Interrupted while waiting for prior teardown to complete.", e);
-      Thread.currentThread().interrupt();
-    }
-    pendingTeardown = null;
   }
 
   private void completeStop() {
