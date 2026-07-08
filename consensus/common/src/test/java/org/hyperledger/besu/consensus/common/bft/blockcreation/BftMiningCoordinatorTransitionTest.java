@@ -229,21 +229,20 @@ public class BftMiningCoordinatorTransitionTest {
 
     final AtomicInteger activeTeardowns = new AtomicInteger(0);
     final AtomicInteger maxActiveTeardowns = new AtomicInteger(0);
-    final AtomicInteger stopInvocation = new AtomicInteger(0);
     final CountDownLatch firstTeardownEntered = new CountDownLatch(1);
-    final CountDownLatch releaseFirstTeardown = new CountDownLatch(1);
 
-    // Track how many teardowns (eventHandler.stop() calls) are executing at once, and hold the
-    // FIRST one open (simulating "Thread A ... is now down in teardown") until released.
+    // Every teardown (eventHandler.stop() call) takes a fixed amount of real time. This widens
+    // the window in which a second, concurrently-dispatched teardown could overlap with it if
+    // start() failed to wait for a prior one to finish - an overlap between two independent
+    // async tasks is timing-dependent, so a wide, fixed window makes it reliably observable
+    // instead of depending on incidental scheduling luck.
     doAnswer(
             invocation -> {
               final int active = activeTeardowns.incrementAndGet();
               maxActiveTeardowns.updateAndGet(max -> Math.max(max, active));
+              firstTeardownEntered.countDown();
               try {
-                if (stopInvocation.incrementAndGet() == 1) {
-                  firstTeardownEntered.countDown();
-                  releaseFirstTeardown.await();
-                }
+                Thread.sleep(300);
               } finally {
                 activeTeardowns.decrementAndGet();
               }
@@ -276,21 +275,22 @@ public class BftMiningCoordinatorTransitionTest {
 
     assertThat(firstTeardownEntered.await(10, TimeUnit.SECONDS)).isTrue();
 
-    // Thread B: a concurrent restart while A's (artificially extended) teardown is in flight.
+    // Thread B: a concurrent restart while A's teardown is still sleeping.
     final Thread threadB = new Thread(coordinator::start);
     threadB.start();
 
-    // Give start() a chance to (wrongly) race ahead if it doesn't wait for A's teardown.
-    Thread.sleep(500);
+    // A correct start() blocks for close to the full 300 ms teardown; give it a much shorter
+    // window to (wrongly) race ahead if it doesn't wait for A's teardown at all.
+    Thread.sleep(50);
     assertThat(threadB.isAlive()).isTrue();
 
-    releaseFirstTeardown.countDown();
     threadB.join(TimeUnit.SECONDS.toMillis(10));
     assertThat(threadB.isAlive()).isFalse();
     assertThat(coordinator.isMining()).isTrue();
 
     // Thread C: the newly-restarted event thread dispatches another event immediately after B's
-    // restart succeeded, calling stop() reentrantly again.
+    // restart succeeded, calling stop() reentrantly again - while, if unguarded, A's teardown
+    // could still be sleeping.
     eventQueue.add(new BlockTimerExpiry(new ConsensusRoundIdentifier(1, 0)));
     Awaitility.await().atMost(Duration.ofSeconds(10)).until(() -> !coordinator.isMining());
     bftExecutors.awaitStop();
