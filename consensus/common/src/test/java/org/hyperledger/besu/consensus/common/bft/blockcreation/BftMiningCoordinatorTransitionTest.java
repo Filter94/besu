@@ -15,6 +15,7 @@
 package org.hyperledger.besu.consensus.common.bft.blockcreation;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.doAnswer;
 
 import org.hyperledger.besu.consensus.common.bft.BftEventQueue;
 import org.hyperledger.besu.consensus.common.bft.BftExecutors;
@@ -28,7 +29,9 @@ import org.hyperledger.besu.ethereum.chain.Blockchain;
 import org.hyperledger.besu.metrics.noop.NoOpMetricsSystem;
 
 import java.time.Duration;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -126,5 +129,75 @@ public class BftMiningCoordinatorTransitionTest {
     coordinator.stop();
 
     assertThat(coordinator.isMining()).isFalse();
+  }
+
+  @Test
+  @Timeout(value = 15, unit = TimeUnit.SECONDS)
+  public void startWaitsForInFlightTeardownFromPriorEventThreadStop() throws InterruptedException {
+    final BftEventQueue eventQueue = new BftEventQueue(1000);
+    eventQueue.start();
+    final BftExecutors bftExecutors =
+        BftExecutors.create(new NoOpMetricsSystem(), BftExecutors.ConsensusType.QBFT);
+
+    // Block completeStop() part-way through, inside eventHandler.stop(), so the test can
+    // deterministically observe "teardown is in flight" before letting it finish.
+    final CountDownLatch teardownStarted = new CountDownLatch(1);
+    final CountDownLatch releaseTeardown = new CountDownLatch(1);
+    doAnswer(
+            invocation -> {
+              teardownStarted.countDown();
+              releaseTeardown.await();
+              return null;
+            })
+        .when(eventHandler)
+        .stop();
+
+    final AtomicReference<BftMiningCoordinator> coordinatorRef = new AtomicReference<>();
+    // Simulates the TTD watcher: disable() then stop(), invoked on the BFT event thread.
+    final EventMultiplexer eventMultiplexer =
+        new EventMultiplexer(eventHandler) {
+          @Override
+          public void handleBftEvent(final BftEvent bftEvent) {
+            coordinatorRef.get().disable();
+            coordinatorRef.get().stop();
+          }
+        };
+
+    final BftProcessor bftProcessor = new BftProcessor(eventQueue, eventMultiplexer);
+    final BftMiningCoordinator coordinator =
+        new BftMiningCoordinator(
+            bftExecutors, eventHandler, bftProcessor, blockCreatorFactory, blockchain, eventQueue);
+    coordinatorRef.set(coordinator);
+
+    coordinator.enable();
+    coordinator.start();
+    eventQueue.add(new BlockTimerExpiry(new ConsensusRoundIdentifier(1, 0)));
+
+    // Wait until stop()'s async teardown thread is blocked inside eventHandler.stop().
+    assertThat(teardownStarted.await(10, TimeUnit.SECONDS)).isTrue();
+
+    // A concurrent restart must block until that teardown finishes, not race ahead of it.
+    final AtomicBoolean startReturned = new AtomicBoolean(false);
+    final Thread restarter =
+        new Thread(
+            () -> {
+              coordinator.start();
+              startReturned.set(true);
+            });
+    restarter.start();
+
+    // Give start() a chance to (wrongly) return early if it doesn't wait for the teardown.
+    Thread.sleep(500);
+    assertThat(startReturned.get()).isFalse();
+
+    releaseTeardown.countDown();
+    restarter.join(TimeUnit.SECONDS.toMillis(10));
+    assertThat(startReturned.get()).isTrue();
+
+    // The restarted cycle is genuinely running and was never told to stop; tear it down
+    // explicitly (this stop() runs on the test thread, not the event thread, so it completes
+    // its teardown inline) before awaiting so no threads leak into later tests.
+    coordinator.stop();
+    bftExecutors.awaitStop();
   }
 }
