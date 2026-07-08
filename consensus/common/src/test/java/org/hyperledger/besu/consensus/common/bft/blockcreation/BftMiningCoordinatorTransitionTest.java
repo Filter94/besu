@@ -200,4 +200,102 @@ public class BftMiningCoordinatorTransitionTest {
     coordinator.stop();
     bftExecutors.awaitStop();
   }
+
+  /**
+   * Reproduces the exact scenario raised in PR review (besu-eth/besu#10733, discussion
+   * r3543146286):
+   *
+   * <ol>
+   *   <li>state = RUNNING
+   *   <li>Thread A calls stop(): CAS(RUNNING to STOPPED) succeeds, and is now down in teardown
+   *       (awaitStop() etc. - which takes real time)
+   *   <li>Thread B calls start(): CAS(STOPPED to RUNNING) succeeds, bftProcessor.start()...
+   *   <li>Thread C calls stop(): CAS(RUNNING to STOPPED) succeeds, enters teardown while A is still
+   *       in its teardown
+   * </ol>
+   *
+   * Both A and C are the BFT event thread calling stop() reentrantly (the merge transition
+   * watcher's actual calling pattern), which is when stop() defers its teardown and this overlap
+   * would be possible without start()'s pendingTeardown.join(). This test proves A's and C's
+   * teardowns never run concurrently.
+   */
+  @Test
+  @Timeout(value = 20, unit = TimeUnit.SECONDS)
+  public void concurrentStopStartStopNeverOverlapsTeardowns() throws InterruptedException {
+    final BftEventQueue eventQueue = new BftEventQueue(1000);
+    eventQueue.start();
+    final BftExecutors bftExecutors =
+        BftExecutors.create(new NoOpMetricsSystem(), BftExecutors.ConsensusType.QBFT);
+
+    final AtomicInteger activeTeardowns = new AtomicInteger(0);
+    final AtomicInteger maxActiveTeardowns = new AtomicInteger(0);
+    final AtomicInteger stopInvocation = new AtomicInteger(0);
+    final CountDownLatch firstTeardownEntered = new CountDownLatch(1);
+    final CountDownLatch releaseFirstTeardown = new CountDownLatch(1);
+
+    // Track how many teardowns (eventHandler.stop() calls) are executing at once, and hold the
+    // FIRST one open (simulating "Thread A ... is now down in teardown") until released.
+    doAnswer(
+            invocation -> {
+              final int active = activeTeardowns.incrementAndGet();
+              maxActiveTeardowns.updateAndGet(max -> Math.max(max, active));
+              try {
+                if (stopInvocation.incrementAndGet() == 1) {
+                  firstTeardownEntered.countDown();
+                  releaseFirstTeardown.await();
+                }
+              } finally {
+                activeTeardowns.decrementAndGet();
+              }
+              return null;
+            })
+        .when(eventHandler)
+        .stop();
+
+    final AtomicReference<BftMiningCoordinator> coordinatorRef = new AtomicReference<>();
+    // Every dispatched event stops the coordinator reentrantly from the BFT event thread,
+    // mirroring the merge transition watcher's calling pattern for both Thread A and Thread C.
+    final EventMultiplexer eventMultiplexer =
+        new EventMultiplexer(eventHandler) {
+          @Override
+          public void handleBftEvent(final BftEvent bftEvent) {
+            coordinatorRef.get().stop();
+          }
+        };
+
+    final BftProcessor bftProcessor = new BftProcessor(eventQueue, eventMultiplexer);
+    final BftMiningCoordinator coordinator =
+        new BftMiningCoordinator(
+            bftExecutors, eventHandler, bftProcessor, blockCreatorFactory, blockchain, eventQueue);
+    coordinatorRef.set(coordinator);
+
+    coordinator.enable();
+    coordinator.start();
+    // Thread A: the event thread dispatches this event, calling stop() reentrantly.
+    eventQueue.add(new BlockTimerExpiry(new ConsensusRoundIdentifier(1, 0)));
+
+    assertThat(firstTeardownEntered.await(10, TimeUnit.SECONDS)).isTrue();
+
+    // Thread B: a concurrent restart while A's (artificially extended) teardown is in flight.
+    final Thread threadB = new Thread(coordinator::start);
+    threadB.start();
+
+    // Give start() a chance to (wrongly) race ahead if it doesn't wait for A's teardown.
+    Thread.sleep(500);
+    assertThat(threadB.isAlive()).isTrue();
+
+    releaseFirstTeardown.countDown();
+    threadB.join(TimeUnit.SECONDS.toMillis(10));
+    assertThat(threadB.isAlive()).isFalse();
+    assertThat(coordinator.isMining()).isTrue();
+
+    // Thread C: the newly-restarted event thread dispatches another event immediately after B's
+    // restart succeeded, calling stop() reentrantly again.
+    eventQueue.add(new BlockTimerExpiry(new ConsensusRoundIdentifier(1, 0)));
+    Awaitility.await().atMost(Duration.ofSeconds(10)).until(() -> !coordinator.isMining());
+    bftExecutors.awaitStop();
+
+    // The guarantee under test: A's and C's teardowns never executed concurrently.
+    assertThat(maxActiveTeardowns.get()).isEqualTo(1);
+  }
 }
